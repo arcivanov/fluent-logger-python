@@ -44,6 +44,12 @@ class EventTime(msgpack.ExtType):
             data=struct.pack(">II", seconds, nanoseconds),
         )
 
+class RoundRobinLB:
+    pass
+
+class FailOverLB:
+    pass
+
 
 class FluentSender(object):
     def __init__(self,
@@ -56,6 +62,8 @@ class FluentSender(object):
                  buffer_overflow_handler=None,
                  nanosecond_precision=False,
                  msgpack_kwargs=None,
+                 load_balancer=FailOverLB,
+
                  **kwargs):
         """
         :param kwargs: This kwargs argument is not used in __init__. This will be removed in the next major version.
