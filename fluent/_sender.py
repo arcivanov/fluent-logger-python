@@ -9,32 +9,30 @@ except NameError:  # pragma: no cover
     basestring = (str, bytes)
     unicode = str
 
-from threading import RLock
-
 try:
     from urllib.parse import urlparse
 except ImportError:
     from urlparse import urlparse
 
-from collections import deque, OrderedDict as odict
-
-import time
-import sys
-import os
 import logging
-from base64 import b64encode
-from uuid import uuid1
-from time import sleep
-from os.path import abspath
-from hashlib import sha512
-from msgpack import Unpacker, Packer
-from queue import Queue
-from msgpack.fallback import Unpacker
-from threading import Thread
+import os
 import socket
-from select import select
+import sys
+from base64 import b64encode
+from collections import deque, OrderedDict as odict
 from errno import EWOULDBLOCK, EINPROGRESS
+from hashlib import sha512
+from os.path import abspath
+from queue import Queue, Full, Empty
+from select import select
 from subprocess import Popen
+from threading import Thread, Condition, RLock, Semaphore, BoundedSemaphore
+from time import sleep
+from time import time
+from uuid import uuid1
+
+from msgpack import Unpacker, Packer
+from msgpack.fallback import Unpacker
 
 if sys.platform == "win32" and sys.version_info[:2] < (3, 5):
     import backport.socketpair
@@ -103,34 +101,262 @@ def endpoint(url, **kwargs):
     return endpoint(**kwargs)
 
 
+class QueueDict(odict):
+    def __init__(self, maxsize=0):
+        self.maxsize = maxsize
+        self._init(maxsize)
+
+        # mutex must be held whenever the queue is mutating.  All methods
+        # that acquire mutex must release it before returning.  mutex
+        # is shared between the three conditions, so acquiring and
+        # releasing the conditions also acquires and releases mutex.
+        self.mutex = RLock()
+
+        # Notify not_empty whenever an item is added to the queue; a
+        # thread waiting to get is notified then.
+        self.not_empty = Condition(self.mutex)
+
+        # Notify not_full whenever an item is removed from the queue;
+        # a thread waiting to put is notified then.
+        self.not_full = Condition(self.mutex)
+
+        # Notify all_tasks_done whenever the number of unfinished tasks
+        # drops to zero; thread waiting to join() is notified to resume
+        self.all_tasks_done = Condition(self.mutex)
+        self.unfinished_tasks = 0
+
+    def task_done(self):
+        '''Indicate that a formerly enqueued task is complete.
+
+        Used by Queue consumer threads.  For each get() used to fetch a task,
+        a subsequent call to task_done() tells the queue that the processing
+        on the task is complete.
+
+        If a join() is currently blocking, it will resume when all items
+        have been processed (meaning that a task_done() call was received
+        for every item that had been put() into the queue).
+
+        Raises a ValueError if called more times than there were items
+        placed in the queue.
+        '''
+        with self.all_tasks_done:
+            unfinished = self.unfinished_tasks - 1
+            if unfinished <= 0:
+                if unfinished < 0:
+                    raise ValueError('task_done() called too many times')
+                self.all_tasks_done.notify_all()
+            self.unfinished_tasks = unfinished
+
+    def join(self):
+        '''Blocks until all items in the Queue have been gotten and processed.
+
+        The count of unfinished tasks goes up whenever an item is added to the
+        queue. The count goes down whenever a consumer thread calls task_done()
+        to indicate the item was retrieved and all work on it is complete.
+
+        When the count of unfinished tasks drops to zero, join() unblocks.
+        '''
+        with self.all_tasks_done:
+            while self.unfinished_tasks:
+                self.all_tasks_done.wait()
+
+    def qsize(self):
+        '''Return the approximate size of the queue (not reliable!).'''
+        with self.mutex:
+            return self._qsize()
+
+    def empty(self):
+        '''Return True if the queue is empty, False otherwise (not reliable!).
+
+        This method is likely to be removed at some point.  Use qsize() == 0
+        as a direct substitute, but be aware that either approach risks a race
+        condition where a queue can grow before the result of empty() or
+        qsize() can be used.
+
+        To create code that needs to wait for all queued tasks to be
+        completed, the preferred technique is to use the join() method.
+        '''
+        with self.mutex:
+            return not self._qsize()
+
+    def full(self):
+        '''Return True if the queue is full, False otherwise (not reliable!).
+
+        This method is likely to be removed at some point.  Use qsize() >= n
+        as a direct substitute, but be aware that either approach risks a race
+        condition where a queue can shrink before the result of full() or
+        qsize() can be used.
+        '''
+        with self.mutex:
+            return 0 < self.maxsize <= self._qsize()
+
+    def put(self, key, block=True, timeout=None, value=None):
+        '''Put an item into the queue.
+
+        If optional args 'block' is true and 'timeout' is None (the default),
+        block if necessary until a free slot is available. If 'timeout' is
+        a non-negative number, it blocks at most 'timeout' seconds and raises
+        the Full exception if no free slot was available within that time.
+        Otherwise ('block' is false), put an item on the queue if a free slot
+        is immediately available, else raise the Full exception ('timeout'
+        is ignored in that case).
+        '''
+        with self.not_full:
+            if self.maxsize > 0:
+                if not block:
+                    if self._qsize() >= self.maxsize:
+                        raise Full
+                elif timeout is None:
+                    while self._qsize() >= self.maxsize:
+                        self.not_full.wait()
+                elif timeout < 0:
+                    raise ValueError("'timeout' must be a non-negative number")
+                else:
+                    endtime = time() + timeout
+                    while self._qsize() >= self.maxsize:
+                        remaining = endtime - time()
+                        if remaining <= 0.0:
+                            raise Full
+                        self.not_full.wait(remaining)
+            self._put(key, value)
+            self.unfinished_tasks += 1
+            self.not_empty.notify()
+
+    def get(self, block=True, timeout=None):
+        '''Remove and return an item from the queue.
+
+        If optional args 'block' is true and 'timeout' is None (the default),
+        block if necessary until an item is available. If 'timeout' is
+        a non-negative number, it blocks at most 'timeout' seconds and raises
+        the Empty exception if no item was available within that time.
+        Otherwise ('block' is false), return an item if one is immediately
+        available, else raise the Empty exception ('timeout' is ignored
+        in that case).
+        '''
+        with self.not_empty:
+            if not block:
+                if not self._qsize():
+                    raise Empty
+            elif timeout is None:
+                while not self._qsize():
+                    self.not_empty.wait()
+            elif timeout < 0:
+                raise ValueError("'timeout' must be a non-negative number")
+            else:
+                endtime = time() + timeout
+                while not self._qsize():
+                    remaining = endtime - time()
+                    if remaining <= 0.0:
+                        raise Empty
+                    self.not_empty.wait(remaining)
+            item = self._get()
+            self.not_full.notify()
+            return item
+
+    def pop(self, key, block=True, timeout=None):
+        '''Pop and return a specific item from the queue.
+
+        If optional args 'block' is true and 'timeout' is None (the default),
+        block if necessary until an item is available. If 'timeout' is
+        a non-negative number, it blocks at most 'timeout' seconds and raises
+        the Empty exception if no item was available within that time.
+        Otherwise ('block' is false), return an item if one is immediately
+        available, else raise the Empty exception ('timeout' is ignored
+        in that case).
+        '''
+        with self.not_empty:
+            if not block:
+                item = self._pop(key)
+            elif timeout is None:
+                while not self._qsize():
+                    self.not_empty.wait()
+                    item = self._pop(key)
+                    if item:
+                        break
+            elif timeout < 0:
+                raise ValueError("'timeout' must be a non-negative number")
+            else:
+                endtime = time() + timeout
+                while not self._qsize():
+                    remaining = endtime - time()
+                    if remaining <= 0.0:
+                        raise Empty
+                    self.not_empty.wait(remaining)
+                    item = self._pop(key)
+                    if item:
+                        break
+
+            self.not_full.notify()
+            return item
+
+    def put_nowait(self, item):
+        '''Put an item into the queue without blocking.
+
+        Only enqueue the item if a free slot is immediately available.
+        Otherwise raise the Full exception.
+        '''
+        return self.put(item, block=False)
+
+    def get_nowait(self):
+        '''Remove and return an item from the queue without blocking.
+
+        Only get an item if one is immediately available. Otherwise
+        raise the Empty exception.
+        '''
+        return self.get(block=False)
+
+    # Override these methods to implement other queue organizations
+    # (e.g. stack or priority queue).
+    # These will only be called with appropriate locks held
+
+    # Initialize the queue representation
+    def _init(self, maxsize):
+        self.queue = odict()
+
+    def _qsize(self):
+        return len(self.queue)
+
+    # Put a new item in the queue
+    def _put(self, key, value):
+        self.queue[key] = value
+
+    # Get an item from the queue
+    def _get(self):
+        return self.queue.popitem(False)
+
+    def _pop(self, key):
+        return self.queue.pop(key, None)
+
+
+qdict = QueueDict
+
+
 class Endpoint:
-    """And endpoint is a single FluentD server or a server cluster that operates cohesively as one unit.
+    """An ``Endpoint`` represents a single FluentD server or a server cluster that operates cohesively as one unit.
     Endpoint may have multiple ``EndpointConnection``s that may come and go as cluster nodes are spun up and die.
 
     """
 
-    def __init__(self, shared_key=None, username=None, password=None):
-        self.connections = odict()
-        self.sender_c = None
+    self_fqdn = to_bytes(socket.getfqdn())
 
+    def __init__(self, _url, shared_key=None, username=None, password=None):
+        self.url = _url
         self.shared_key = shared_key
         self.username = username
         self.password = password
 
-        self.self_fqdn = to_bytes(socket.getfqdn())
+        self.connections = odict()
+        self.sender_c = None
 
     def attach(self, sender_c):
         self.sender_c = sender_c
 
-    def protocol(self):
-        pass
-
     def addrs(self):
         """Returns all socket addresses """
-        pass
+        raise NotImplementedError
 
     def connection(self):
-        return EndpointConnection
+        raise NotImplementedError
 
     def refresh_connections(self):
         """Called by SenderConnection when it's time to refresh the connections"""
@@ -151,11 +377,53 @@ class Endpoint:
         return removed_addrs, new_addrs
 
 
+class InetEndpoint(Endpoint):
+    default_port = 24224
+
+    def __init__(self, *args, prefer_ipv6=False, **kwargs):
+        super(InetEndpoint, self).__init__(*args, **kwargs)
+        netloc_hosts = self.url.netloc.split(",")
+        self.netloc_addrs = [addr if len(addr) > 1 else (addr[0], self.default_port) for addr in
+                             (hp.split(":") for hp in netloc_hosts)]
+        self.prefer_ipv6 = prefer_ipv6
+        self.addr_family_kind_proto = {}
+
+    def addrs(self):
+        results = []
+        for addr in self.netloc_addrs:
+            host_addrs = socket.getaddrinfo(host=addr[0], port=addr[1], **self.addr_family_kind_proto)
+            if self.prefer_ipv6:
+                ipv6_host_addrs = [host_addr for host_addr in host_addrs if host_addr[0] == socket.AF_INET6]
+                if ipv6_host_addrs:
+                    host_addrs = ipv6_host_addrs
+            else:
+                ipv4_host_addrs = [host_addr for host_addr in host_addrs if host_addr[0] == socket.AF_INET]
+                if ipv4_host_addrs:
+                    host_addrs = ipv4_host_addrs
+
+            results.extend(host_addrs)
+
+        return results
+
+
+class TcpEndpoint(InetEndpoint):
+    def __init__(self, *args, **kwargs):
+        super(TcpEndpoint, self).__init__(*args, **kwargs)
+        self.addr_family_kind_proto = {"type": socket.SOCK_STREAM,
+                                       "proto": socket.IPPROTO_TCP}
+
+    def connection(self):
+        return TcpConnection
+
+
+_register_endpoint("tcp+", TcpEndpoint)
+
+
 class EndpointConnection(Thread):
     """One of the connections established for a specific ``Endpoint``. """
 
     def __init__(self, addr, endpoint):
-        super(EndpointConnection, self, ).__init__(name="EP %r" % (addr,), daemon=True)
+        super(EndpointConnection, self, ).__init__(name="EPC %r" % (addr,), daemon=True)
 
         self.addr = addr
         self.endpoint = endpoint
@@ -384,7 +652,7 @@ class EndpointConnection(Thread):
                     logger.warning("Unexpected response received from %s: %s", self.sock.getpeername(), obj)
                     self.close()
                     return
-                self.sender_c._ack_chunk(chunk_id)
+                self.sender_c.ack_chunk(chunk_id)
 
     def _socket(self, addr):
         raise NotImplementedError
@@ -474,21 +742,136 @@ class UnixConnection(StreamConnection):
         return socket.socket(addr[0], addr[1])
 
 
+class MsgMeta:
+    __slots__ = ["deadline", "retries"]
+
+    def __init__(self, deadline):
+        self.deadline = deadline
+        self.retries = 0
+
+
+class AsyncLogStore:
+    def __init__(self, queue_maxsize, queue_circular, send_timeout):
+        self.send_timeout = send_timeout
+        self._queue_circular = queue_circular
+        self._queue = qdict(maxsize=queue_maxsize)
+        self._acks = set()
+        self.mutex = self._queue.mutex
+        self.ack_received = Condition(self.mutex)
+
+    def post(self, msg):
+        remaining = self.send_timeout
+        t1 = time()
+        msg_meta = MsgMeta(t1 + remaining)
+
+        if self.mutex.acquire(timeout=remaining):
+            try:
+                if self._queue_circular and self._queue.full():
+                    # discard oldest
+                    try:
+                        self._queue.get(block=False)
+                    except Empty:  # pragma: no cover
+                        pass
+                t2 = time()
+                remaining -= t2 - t1
+                t1 = t2
+                try:
+                    self._queue.put(msg,
+                                    block=not self._queue_circular,
+                                    timeout=remaining,
+                                    value=msg_meta)
+                except Full:
+                    return False
+                t2 = time()
+                remaining -= t2 - t1
+                t1 = t2
+
+
+            finally:
+                self.mutex.release()
+        else:
+            return False
+
+    def ack(self, msg):
+        with self.mutex:
+            self._acks[msg] = 1
+            self.ack_received.notify_all()
+
+
+class SyncLogStore:
+    def __init__(self, send_timeout, at_least_once):
+        self.send_timeout = send_timeout
+        self.at_least_once = at_least_once
+        self.send_sem = BoundedSemaphore()
+        self.pending_sem = Semaphore(0)
+        self.mutex = RLock()
+        self.delivered = Condition(lock=self.mutex)
+        self.available = Condition(lock=self.mutex)
+        self.msg = None
+
+        self.logger = None
+
+    def post(self, tag, ts, payload):
+        msg = (tag, ts, payload)
+
+        remaining = self.send_timeout
+        t1 = time()
+        deadline = t1 + remaining
+        if self.send_sem.acquire(timeout=remaining):
+            try:
+                with self.mutex:
+                    remaining = deadline - time()
+                    self.msg = msg
+                    self.pending_sem.release()
+                    if self.at_least_once:
+                        return self.delivered.wait(remaining)
+            finally:
+                self.send_sem.release()
+
+    def ack(self, msg):
+        with self.mutex:
+            if msg is self.msg:
+                self.delivered.notify()
+            else:
+                self.logger.warning("Message ACK delivered after timeout", extra={"message", msg})
+
+    def next(self, timeout=None):
+        remaining = timeout
+
+        with self.mutex:
+            while True:
+                if self.msg is not None:
+                    return self.msg
+                if timeout and remaining > 0:
+                    self.available.wait(timeout=remaining)
+                else:
+                    self.available.wait()
+
+
 class SenderConnection(Thread):
-    def __init__(self, endpoints, ha_strategy, refresh_period, logger):
+    def __init__(self,
+                 endpoints,
+                 ha_strategy,
+                 log_store,
+                 refresh_period,
+                 logger):
         """
         Internal Sender connection that maintains an aggregate connection for the Sender.
         The Sender may be connected to various servers and clusters via different protocols over multiple endpoints.
         How endpoints are treated depends on a strategy specified, which is transparent to the Sender.
 
         :param endpoints: iterable of Endpoint
-        :param ha_strategy: a
+        :param ha_strategy: logic underlying selection of the endpoint for sending
+        :param log_store: a store for log messages allowing to customize store behavior
+        :param refresh_period: how often to refresh the endpoints
         :param logger: internal Fluent logger
         """
         super(SenderConnection, self).__init__(name=self.__class__.name, daemon=True)
 
         self.endpoints = endpoints
         self.ha_strategy = ha_strategy
+        self.log_store = log_store
+        self.refresh_period = refresh_period
         self.logger = logger
 
         self.endpoint_connections = {}
@@ -522,27 +905,33 @@ class SenderConnection(Thread):
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.close()
 
-    def _ack_chunk(self, chunk_id):
+    def ack_chunk(self, chunk_id):
         logger.debug("Acknowledging chunk %r", chunk_id)
+
+    def send(self, tag, ts, payload):
+        return self.log_store.post(tag, ts, payload)
 
     def run(self):
         logger = self.logger
         r_int = set()
         w_int = set()
 
+        refresh_period = self.refresh_period
+
         wakeup_sock_r = self.wakeup_sock_r
         r_int.add(wakeup_sock_r)
 
         op_queue = self.op_queue
+        last_ts = time.time()
 
         with wakeup_sock_r, self.wakeup_sock_w:
             while r_int or w_int:
-                r_ready, w_ready, _ = select(r_int, w_int, ())
+                r_ready, w_ready, _ = select(r_int, w_int, (), timeout=refresh_period)
                 for r in r_ready:
                     if r is wakeup_sock_r:
                         while True:
                             try:
-                                cmds = r.recv(4096)
+                                cmds = r.recv(2048)
                             except socket.error as e:
                                 if e.errno == EWOULDBLOCK:
                                     break
@@ -610,35 +999,11 @@ if __name__ == '__main__':
                 "-v", "%s:/var/run/fluent" % abspath("../tests/fluent_sock"),
                 "fluent/fluentd:v1.1.0"]) as docker:
         sleep(5)
-        with SenderConnection([], None, None, logger) as conn:
-            ep1 = Endpoint()
-            ep2 = Endpoint(shared_key="abcd1234")
-            ep3 = Endpoint(shared_key="1234abcd", username="foo", password="bar")
-            ep1.attach(conn)
-            ep2.attach(conn)
-            ep3.attach(conn)
-
-            epc1 = TcpConnection(
-                (socket.AddressFamily.AF_INET, socket.SocketKind.SOCK_STREAM, socket.IPPROTO_TCP, "",
-                 ("127.0.0.1", 24224)),
-                ep1, 16384)
-            # epc2 = UdpConnection(
-            #    (socket.AddressFamily.AF_INET, socket.SocketKind.SOCK_DGRAM, socket.IPPROTO_UDP, "",
-            #     ("127.0.0.1", 24225)),
-            #    ep2, 8192, "0.0.0.0")
-            unix_path = abspath("../tests/fluent_sock/fluent.sock")
-            epc3 = UnixConnection(
-                (socket.AddressFamily.AF_UNIX, socket.SocketKind.SOCK_STREAM, socket.IPPROTO_TCP, "",
-                 unix_path),
-                ep3, 16384)
-
-            for epc in (epc1, epc3):
-                epc.connect()
-                conn.schedule_op(OP_READ, epc)
-                epc.send_msg("tag-name", time.time(), {"value-x": "a", "value-y": 1}, ack=True)
-                epc.send_msgs("tag-name", ((int(time.time()), {"value-x": "a", "value-y": 1}),
-                                           (int(time.time()), {"value-x": "m", "value-b": 200})), ack=True)
-                sleep(3)
-                epc.close()
+        log_store = SyncLogStore(send_timeout=3.0)
+        with SenderConnection([endpoint("tcp://localhost:24224")], None, log_store, 5.0, logger) as conn:
+            conn.send("tag-name", time.time(), {"value-x": "a", "value-y": 1})
+            conn.send_msgs("tag-name", ((int(time.time()), {"value-x": "a", "value-y": 1}),
+                                        (int(time.time()), {"value-x": "m", "value-b": 200})))
+            sleep(3)
 
         docker.terminate()
