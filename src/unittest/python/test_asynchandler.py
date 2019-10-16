@@ -6,7 +6,7 @@ import unittest
 
 import fluent.asynchandler
 import fluent.handler
-from tests import mockserver
+from src.unittest.python import mockserver
 
 
 class TestHandler(unittest.TestCase):

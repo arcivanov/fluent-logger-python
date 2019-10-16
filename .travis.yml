@@ -1,35 +1,34 @@
-sudo: false
-language: python
-python:
-  - "2.7"
-  - "3.4"
-  - "3.5"
-  - "3.6"
-  - "3.7"
-  - "3.8"
-  - pypy
-  - pypy3
-  - nightly
-# command to install dependencies, e.g. pip install -r requirements.txt --use-mirrors
-install:
-    - "pip install -e ."
-    - "pip install 'coverage~=4.5.4' coveralls"
-script:
-    - "PYTHONFAULTHANDLER=x timeout -sABRT 30s nosetests -vsd"
-after_success:
-    - coveralls
+language: c
+dist: bionic
+os:
+  - linux
+#  - osx
+#  - windows
+#osx_image: xcode11.3
+services:
+  - docker
+addons:
+  apt:
+    packages:
+      - docker-ce
+env:
+  jobs:
+    - PYTHON_VERSION="3.8.3"
+    - PYTHON_VERSION="3.7.7"
+    - PYTHON_VERSION="3.6.10"
+    - PYTHON_VERSION="3.5.9"
+    - PYTHON_VERSION="3.9.0b1"
+  global:
+    - DEPLOY_BRANCHES: "'master'"
+    - DEPLOY_PYTHONS: "'3.8.3'"
+    - DEPLOY_OSES: "'linux'"
+    - PYB_ARGS: "'-E ci -v -X analyze install'"
+    - TWINE_USERNAME: repeatedly
+    - secure: CpNaj4F3TZvpP1aSJWidh/XexrWODV2sBdObrYU79Gyh9hFl6WLsA3JM9BfVsy9cGb/P/jP6ly4Z0/6qdIzZ5D6FPOB1B7rn5GZ2LAMOypRCA6W2uJbRjUU373Wut0p0OmQcMPto6XJsMlpvOEq+1uAq+LLAnAGEmmYTeskZebs=
 
-deploy:
-  provider: pypi
-  user: repeatedly
-  server: https://upload.pypi.org/legacy/
-  password:
-    secure: CpNaj4F3TZvpP1aSJWidh/XexrWODV2sBdObrYU79Gyh9hFl6WLsA3JM9BfVsy9cGb/P/jP6ly4Z0/6qdIzZ5D6FPOB1B7rn5GZ2LAMOypRCA6W2uJbRjUU373Wut0p0OmQcMPto6XJsMlpvOEq+1uAq+LLAnAGEmmYTeskZebs=
-  on:
-    tags: true
-    condition: '"$TRAVIS_PYTHON_VERSION" = "3.8" || "$TRAVIS_PYTHON_VERSION" = "2.7"'
-  distributions: "sdist bdist_wheel"
+cache:
+  directories:
+    - $HOME/.pyenv
 
-matrix:
-  allow_failures:
-    - python: nightly
+install: travis_wait 30 python travis/travis_shim.py install
+script: travis_wait 60 python travis/travis_shim.py build

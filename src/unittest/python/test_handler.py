@@ -5,7 +5,7 @@ import sys
 import unittest
 
 import fluent.handler
-from tests import mockserver
+from src.unittest.python import mockserver
 
 
 class TestHandler(unittest.TestCase):

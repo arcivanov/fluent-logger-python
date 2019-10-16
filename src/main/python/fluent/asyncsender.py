@@ -10,9 +10,8 @@ except ImportError:
     from Queue import Queue, Full, Empty
 
 from fluent import sender
-from fluent.sender import EventTime
 
-__all__ = ["EventTime", "FluentSender"]
+__all__ = ["FluentSender"]
 
 DEFAULT_QUEUE_MAXSIZE = 100
 DEFAULT_QUEUE_CIRCULAR = False
